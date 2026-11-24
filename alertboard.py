@@ -48,6 +48,19 @@ def init_db():
                 raw TEXT NOT NULL
             )"""
         )
+        # AI columns (added for the Ollama triage step; older databases get
+        # them added in place so existing alerts are kept).
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(alerts)")}
+        for col in ("ai_urgency", "ai_summary"):
+            if col not in cols:
+                conn.execute("ALTER TABLE alerts ADD COLUMN %s TEXT" % col)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS digests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                received TEXT NOT NULL,
+                raw TEXT NOT NULL
+            )"""
+        )
 
 
 def dig(obj, *path):
@@ -81,7 +94,10 @@ def extract(alert):
     """Accept the raw Wazuh/Shuffle payload ($exec) or a flat custom body."""
     full = alert.get("all_fields") if isinstance(alert.get("all_fields"), dict) else alert
     data = full.get("data") if isinstance(full.get("data"), dict) else {}
+    ai = alert.get("ai_analysis") if isinstance(alert.get("ai_analysis"), dict) else {}
     return {
+        "ai_urgency": clean(ai.get("urgency")),
+        "ai_summary": clean(ai.get("summary") or ai.get("error")),
         "event_time": clean(full.get("timestamp") or alert.get("timestamp")),
         "level": to_int(dig(full, "rule", "level") or alert.get("level") or alert.get("severity")),
         "rule_id": clean(dig(full, "rule", "id") or alert.get("rule_id")),
@@ -101,8 +117,8 @@ def save(alert):
     with db_lock, db() as conn:
         cur = conn.execute(
             """INSERT INTO alerts (received, event_time, level, rule_id, description, agent,
-               srcip, srcuser, mitre, full_log, raw)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+               srcip, srcuser, mitre, full_log, ai_urgency, ai_summary, raw)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 fields["event_time"],
@@ -114,6 +130,8 @@ def save(alert):
                 fields["srcuser"],
                 fields["mitre"],
                 fields["full_log"],
+                fields["ai_urgency"],
+                fields["ai_summary"],
                 json.dumps(alert),
             ),
         )
@@ -123,6 +141,21 @@ def save(alert):
 def list_alerts(limit=500):
     with db_lock, db() as conn:
         rows = conn.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_digest(digest):
+    with db_lock, db() as conn:
+        cur = conn.execute(
+            "INSERT INTO digests (received, raw) VALUES (?, ?)",
+            (datetime.now(timezone.utc).isoformat(timespec="seconds"), json.dumps(digest)),
+        )
+        return cur.lastrowid
+
+
+def list_digests(limit=7):
+    with db_lock, db() as conn:
+        rows = conn.execute("SELECT * FROM digests ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -148,13 +181,17 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/alerts":
             limit = to_int(parse_qs(url.query).get("limit", ["500"])[0]) or 500
             self.send(200, json.dumps(list_alerts(min(limit, 5000))))
+        elif url.path == "/api/digests":
+            limit = to_int(parse_qs(url.query).get("limit", ["7"])[0]) or 7
+            self.send(200, json.dumps(list_digests(min(limit, 100))))
         elif url.path == "/health":
             self.send(200, '{"ok": true}')
         else:
             self.send(404, '{"error": "not found"}')
 
     def do_POST(self):
-        if urlparse(self.path).path != "/api/alerts":
+        path = urlparse(self.path).path
+        if path not in ("/api/alerts", "/api/digests"):
             self.send(404, '{"error": "not found"}')
             return
         length = to_int(self.headers.get("Content-Length")) or 0
@@ -166,6 +203,11 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except ValueError:
             body = {"text": raw.decode(errors="replace")}
+        if path == "/api/digests":
+            if not isinstance(body, dict):
+                body = {"report": str(body)}
+            self.send(201, json.dumps({"success": True, "id": save_digest(body)}))
+            return
         alerts = body if isinstance(body, list) else [body]
         ids = [save(a if isinstance(a, dict) else {"text": str(a)}) for a in alerts]
         self.send(201, json.dumps({"success": True, "ids": ids}))
@@ -231,6 +273,20 @@ PAGE = r"""<!doctype html>
   pre { margin: 0; padding: 14px; background: #0b1015; border-radius: 8px; overflow: auto; max-height: 420px;
         font-size: 12px; white-space: pre-wrap; word-break: break-word; }
   .empty { padding: 40px; text-align: center; color: var(--muted); }
+  td.ai { white-space: normal; min-width: 280px; max-width: 420px; }
+  .urg { display: inline-block; padding: 1px 8px; margin-right: 6px; border-radius: 999px; font-size: 11px;
+         font-weight: 650; text-transform: uppercase; letter-spacing: .4px; color: #111; }
+  .urg.urgent { background: var(--crit); } .urg.investigate { background: var(--high); }
+  .urg.monitor { background: var(--med); } .urg.ignore { background: var(--line); color: var(--text); }
+  .digest { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+            margin-top: 12px; }
+  .digest h2 { font-size: 13px; margin: 0 0 6px; color: var(--muted); font-weight: 500;
+               text-transform: uppercase; letter-spacing: .5px; }
+  .digest .headline { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .digest ul, .aibox ul { margin: 6px 0 0; padding-left: 20px; }
+  .aibox { margin-bottom: 10px; padding: 12px 14px; border-left: 3px solid var(--low); background: #0b1015;
+           border-radius: 6px; white-space: normal; }
+  .aibox b { color: var(--muted); font-weight: 500; }
 </style>
 </head>
 <body>
@@ -248,13 +304,19 @@ PAGE = r"""<!doctype html>
     <div class="card" data-sev="med"><div class="n" style="color:var(--med)" id="c-med">0</div><div class="l">Medium (7-11)</div></div>
     <div class="card" data-sev="low"><div class="n" style="color:var(--low)" id="c-low">0</div><div class="l">Low (0-6)</div></div>
   </div>
+  <div class="digest" id="digest" hidden>
+    <h2>AI daily digest <span id="d-when" class="muted"></span></h2>
+    <div class="headline" id="d-headline"></div>
+    <div id="d-report"></div>
+    <ul id="d-todo"></ul>
+  </div>
   <div class="toolbar">
     <input id="q" placeholder="Search rule, agent, IP, user...">
     <button id="clear">Clear all</button>
   </div>
   <div class="wrap">
     <table>
-      <thead><tr><th>Received</th><th>Level</th><th>Rule</th><th>Description</th><th>Agent</th><th>Source IP</th><th>User</th><th>MITRE</th></tr></thead>
+      <thead><tr><th>Received</th><th>Level</th><th>Rule</th><th>Description</th><th>Agent</th><th>Source IP</th><th>User</th><th>MITRE</th><th>AI triage</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <div class="empty" id="empty">No alerts yet. Waiting for Shuffle...</div>
@@ -289,7 +351,8 @@ function render(newIds) {
 
   const shown = alerts.filter(a =>
     (sevFilter === "all" || sevOf(a.level) === sevFilter) &&
-    (!q || [a.rule_id, a.description, a.agent, a.srcip, a.srcuser, a.mitre, a.full_log]
+    (!q || [a.rule_id, a.description, a.agent, a.srcip, a.srcuser, a.mitre, a.full_log,
+            a.ai_urgency, a.ai_summary]
             .some(v => v && String(v).toLowerCase().includes(q))));
 
   const body = document.getElementById("rows");
@@ -309,21 +372,85 @@ function render(newIds) {
     cell(tr, a.srcip, "mono");
     cell(tr, a.srcuser);
     cell(tr, a.mitre, "mono");
+    const aiTd = cell(tr, "-", "ai");
+    if (a.ai_urgency || a.ai_summary) aiTd.textContent = "";
+    if (a.ai_urgency) {
+      const u = document.createElement("span");
+      u.className = "urg " + a.ai_urgency;
+      u.textContent = a.ai_urgency;
+      aiTd.appendChild(u);
+    }
+    if (a.ai_summary) aiTd.appendChild(document.createTextNode(a.ai_summary));
     tr.onclick = () => { openId = openId === a.id ? null : a.id; render(new Set()); };
     body.appendChild(tr);
     if (openId === a.id) {
       const d = document.createElement("tr"), td = document.createElement("td");
-      td.colSpan = 8;
+      td.colSpan = 9;
       const pre = document.createElement("pre");
-      let raw = a.raw;
-      try { raw = JSON.stringify(JSON.parse(a.raw), null, 2); } catch (e) {}
+      let raw = a.raw, parsed = null;
+      try { parsed = JSON.parse(a.raw); raw = JSON.stringify(parsed, null, 2); } catch (e) {}
+      const ai = parsed && parsed.ai_analysis;
+      if (ai && typeof ai === "object") td.appendChild(aiBox(ai));
       pre.textContent = (a.full_log ? "full_log: " + a.full_log + "\n\n" : "") + raw;
       td.appendChild(pre); d.appendChild(td); body.appendChild(d);
     }
   });
   document.getElementById("empty").style.display = shown.length ? "none" : "block";
 }
+function line(parent, label, value) {
+  if (value == null || value === "") return;
+  const div = document.createElement("div"), b = document.createElement("b");
+  b.textContent = label + ": ";
+  div.appendChild(b);
+  div.appendChild(document.createTextNode(String(value)));
+  parent.appendChild(div);
+}
+function list(parent, items) {
+  if (!Array.isArray(items) || !items.length) return;
+  const ul = document.createElement("ul");
+  items.forEach(t => { const li = document.createElement("li"); li.textContent = String(t); ul.appendChild(li); });
+  parent.appendChild(ul);
+}
+function aiBox(ai) {
+  const box = document.createElement("div");
+  box.className = "aibox";
+  line(box, "AI summary", ai.summary);
+  line(box, "Error", ai.error);
+  line(box, "Attack type", ai.attack_type);
+  line(box, "MITRE", ai.mitre_technique);
+  line(box, "Likely real attack", ai.true_positive_likelihood);
+  line(box, "Urgency", ai.urgency + (ai.urgency_from_model && ai.urgency_from_model !== ai.urgency
+       ? " (model said " + ai.urgency_from_model + ", raised by Wazuh level floor)" : ""));
+  line(box, "Why", ai.reasoning);
+  if (Array.isArray(ai.recommended_actions) && ai.recommended_actions.length) {
+    line(box, "Recommended actions", " ");
+    list(box, ai.recommended_actions);
+  }
+  line(box, "Model", ai.model ? ai.model + (ai.seconds != null ? " (" + ai.seconds + "s)" : "") : null);
+  return box;
+}
+async function loadDigest() {
+  try {
+    const res = await fetch("/api/digests?limit=1", { cache: "no-store" });
+    const rows = await res.json();
+    const el = document.getElementById("digest");
+    if (!rows.length) { el.hidden = true; return; }
+    let d = {};
+    try { d = JSON.parse(rows[0].raw); } catch (e) {}
+    document.getElementById("d-when").textContent = "· " + fmtTime(rows[0].received)
+      + (d.risk_level ? " · risk " + d.risk_level : "");
+    document.getElementById("d-headline").textContent = d.headline || "";
+    document.getElementById("d-report").textContent = d.report || d.error || "";
+    const todo = document.getElementById("d-todo");
+    todo.replaceChildren();
+    (Array.isArray(d.todo) ? d.todo : []).forEach(t => {
+      const li = document.createElement("li"); li.textContent = String(t); todo.appendChild(li);
+    });
+    el.hidden = false;
+  } catch (e) {}
+}
 async function load() {
+  loadDigest();
   try {
     const res = await fetch("/api/alerts?limit=1000", { cache: "no-store" });
     const data = await res.json();
